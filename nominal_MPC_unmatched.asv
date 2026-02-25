@@ -1,0 +1,187 @@
+%% Nominal MPC with tightened constraints (discrete-time closed-loop model)
+% - Uses YALMIP + MOSEK
+% - Dynamics are x_{k+1} = Am_d x_k + Bd u_k
+% - Total applied input (for plotting/constraint checking) is u_total = u + Kx x
+
+%% 0) Setup
+addpath(genpath('C:\Users\taora\OneDrive\桌面\matlab\YALMIP'))
+addpath(genpath('C:\Program Files\Mosek\10.1\toolbox\r2017a'))
+yalmip('clear'); clear; clc;
+
+load uc.mat;   % expects Ucon_nom, tightened constraint
+load xc.mat;   % expects Xcon_nom, tightened constraint
+
+%% 1) Continuous-time model and discretization
+Ac = [0 0.0067  1.34;
+      0 -0.869 43.2;
+      0 0.993 -1.34];
+
+Bc = [  0.169  0.252;
+      -17.3   -1.58;
+       -0.169 -0.252];
+
+% Unmatched channel (not used in dynamics here, but kept for completeness)
+B_perp = null(Bc');
+Bu      = 0.15 * B_perp;
+
+Kx = [ 3.25   0.891  7.12;
+      -6.1   -0.898 -10.0];
+
+Am = Ac + Bc*Kx;   % closed-loop A for the nominal stabilized system
+
+Cc = [1 0 1;
+      1 0 0];
+Dc = zeros(2,2);
+
+nx = 3; nu = 2; ny = 2;
+dT = 4e-3;
+
+% Discretize: state = Am, inputs = [Bc  Bu]
+% We will use Bd (first 2 columns) for MPC decision u
+[Am_d, Bd_total, Cd, ~] = ssdata(c2d(ss(Am, [Bc Bu], Cc, [Dc [0;0]]), dT));
+Bd   = Bd_total(:, 1:nu);
+Bu_d = Bd_total(:, nu+1);  % not used
+
+%% 2) MPC horizon and decision variables
+N  = round(0.2 / dT);   % prediction horizon steps
+
+u = sdpvar(repmat(nu,1,N),   repmat(1,1,N));     % u{1}..u{N}
+x = sdpvar(repmat(nx,1,N+1), repmat(1,1,N+1));   % x{1}..x{N+1}
+r = sdpvar(repmat(ny,1,N+1), repmat(1,1,N+1));   % r{1}..r{N+1}
+
+%% 3) Objective and constraints
+constraints = [];
+objective   = 0;
+
+Qy  = 100;   % tracking weight
+Ru  = 1;     % input magnitude weight
+Rdu = 100;   % input slew weight
+
+for k = 1:N
+    yk = Cd*x{k};
+
+    % Stage cost
+    objective = objective + Qy*norm(yk - r{k}, 2) + Ru*norm(u{k}, 2);
+    if k > 1
+        objective = objective + Rdu*norm(u{k} - u{k-1}, 2);
+    end
+
+    % Dynamics (nominal discrete-time closed-loop model)
+    constraints = [constraints, x{k+1} == Am_d*x{k} + Bd*u{k}];
+
+    % "Total input" used for actuator constraint checking (u_total = u + Kx x)
+    u_total_k = u{k} + Kx*x{k};
+
+    % Input constraints (tightened bounds)
+    constraints = [constraints, -Ucon_nom <= u_total_k <= Ucon_nom];
+
+    % State constraints on x{k+1} (tightened bounds)
+    constraints = [constraints, -Xcon_nom <= x{k+1} <= Xcon_nom];
+end
+
+% Terminal tracking cost (same weight as stage tracking)
+objective = objective + Qy*norm(Cd*x{N+1} - r{N+1}, 2);
+
+parameters_in  = {x{1}, [r{:}]};
+solutions_out  = {[u{:}], [x{:}]};
+
+ops = sdpsettings('solver','mosek','verbose',0);
+controller = optimizer(constraints, objective, ops, parameters_in, solutions_out);
+
+%% 4) Simulation setup
+T     = 15;                        % seconds
+steps = round(T / dT);
+Nt    = steps + 1;
+
+Time = (0:steps) * dT;
+
+% Build reference: first half -> [9; 6.5], second half -> [0; 0]
+% Need length steps + N + 1 because we index ref(:, i:i+N) with i up to Nt
+refLen = Nt + N;
+ref    = zeros(ny, refLen);
+
+halfIdx = floor(steps/2) + 1;   % switching index in 1-based time grid
+ref(:, 1:halfIdx)      = repmat([9; 6.5], 1, halfIdx);
+ref(:, halfIdx+1:end)  = repmat([0; 0],   1, refLen - halfIdx);
+
+%% 5) Closed-loop simulation
+xk = zeros(nx,1);
+
+Xhist  = zeros(nx, Nt);
+Uhist  = zeros(nu, Nt);   % MPC decision input u
+Uthist = zeros(nu, Nt);   % total input u + Kx x (for constraints/plots)
+
+for i = 1:Nt
+    Xhist(:, i) = xk;
+
+    future_r = ref(:, i:i+N);
+    input    = {xk, future_r};
+
+    [sol, diagnostics] = controller{input};
+
+    if diagnostics.problem ~= 0
+        error("MPC infeasible/solver error at i=%d. diagnostics.problem=%d", ...
+              i, diagnostics.problem);
+    end
+
+    Uvec  = sol{1};          % stacked [u1; u2; u1; u2; ...]
+    uk    = Uvec(1:nu);      % apply first control
+    uTot  = uk + Kx*xk;
+
+    Uhist(:, i)  = uk;
+    Uthist(:, i) = uTot;
+
+    % Update nominal state using the MPC model
+    xk = Am_d*xk + Bd*uk;
+end
+
+%% 6) Save outputs
+save umpchist_nominal.mat  Uhist
+save xhist_nominal.mat     Xhist
+save utotalhist_nominal.mat Uthist
+
+%% 7) Plots
+close all;
+
+figure;
+plot(Time, Xhist(1,:) + Xhist(3,:)); hold on;
+plot(Time, ref(1,1:Nt));
+title('theta (x1 + x3)');
+
+figure;
+plot(Time, Xhist(1,:)); hold on;
+plot(Time, ref(2,1:Nt));
+title('gamma (x1)');
+
+figure;
+plot(Time, Xhist(1,:)); hold on;
+plot(Time, Xhist(2,:)); hold on;
+plot(Time, Xhist(3,:));
+legend('x1','x2','x3');
+
+figure;
+plot(Time, Xhist(3,:)); hold on;
+yline( 4, '-', 'State Constraint');
+yline(-4, '-', 'State Constraint');
+title('x3');
+
+figure;
+plot(Time, Uhist(1,:));
+title('de (MPC decision u1)');
+
+figure;
+plot(Time, Uthist(1,:)); hold on;
+yline( 25, '-', 'Input Bound');
+yline(-25, '-', 'Input Bound');
+title('total de (u1 + Kx1*x)');
+
+figure;
+plot(Time, Uhist(2,:));
+title('df (MPC decision u2)');
+
+figure;
+plot(Time, Uthist(2,:)); hold on;
+yline( 22, '-', 'Input Bound');
+yline(-22, '-', 'Input Bound');
+title('total df (u2 + Kx2*x)');
+

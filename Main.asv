@@ -1,0 +1,431 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Main script: Constrained control of F-16 pitch attitude dynamics
+% using nominal MPC + L1 adaptive augmentation
+%
+% What this script does
+%   1) Defines the F-16 pitch attitude model with matched + unmatched uncertainties
+%   2) Sets baseline gains (Kx, Kv) and plant/uncertainty configs
+%   3) Computes L1 error bounds (rho_til_x, rho_u) via compute_L1_bounds
+%   4) Optionally tightens constraints using these bounds
+%   5) Loads the nominal MPC trajectory (Uhist, X) produced by a separate file
+%   6) Runs sim_L1MPC on a fast inner step (sim_config.dT)
+%   7) Downsamples data to MPC sampling (0.004s) for plotting and saving
+%
+% Notation (signals)
+%   x(t)      : plant state (3x1)
+%   u(t)      : actual input to plant (2x1)
+%   u_MPC(k)  : nominal MPC input at slow rate 
+%   x_nom(k)  : nominal MPC state at slow rate 
+%   u_L1(t)   : L1 augmentation signal (2x1) (fast rate sim_config.dT)
+%   f(t,x)    : matched uncertainty entering through B 
+%   w(t)      : unmatched disturbance entering through Bu 
+%
+% Constraint tightening
+%   Xcon_nom = Xcon - |rho_til_x|
+%   Ucon_nom = Ucon - |rho_til_u|, where rho_til_u = |Kx| rho_til_x + rho_u
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+clc
+clear all
+addpath('../');   % project root utilities (e.g., sim_L1MPC, compute_L1_bounds, etc.)
+
+%% 1) Simulation configuration flags
+sim_config.add_uncert                 = 1;   % {0,1}: add uncertainties in plant simulation
+sim_config.use_L1                     = 1;   % {0,1}: enable L1 adaptive augmentation
+sim_config.include_constraint_tighten = 1;   % {0,1}: tighten constraints using L1 bounds
+sim_config.save_file                  = 1;   % {0,1}: save outputs
+sim_config.uncert_type                = 1;   % {1,2}: 1 state+time dependent, 2 time dependent only
+
+% Hard constraints (original)
+Xcon = [10, 100, 4];     % state bounds on x (elementwise): |x1|<=10, |x2|<=100, |x3|<=4
+Ucon = [25; 22];         % input bounds: |u1|<=25, |u2|<=22
+
+sim_config.Xcon = Xcon;
+sim_config.Ucon = Ucon;
+
+%% 2) Uncertainty model configuration
+if sim_config.uncert_type == 1
+    % State + time dependent matched uncertainty f(t,x) and unmatched disturbance w(t)
+    f_uncert = @(t,x) [-0.8*sin(2*pi*0.2*t) - 0.1*x(3)^2;
+                        0.1 - 0.2*x(3)] * 1.8;     % 2x1
+    w_uncert = @(t)    sin(2*pi*0.3*t) * 1;        % scalar
+
+    w_max = [2.4; 0.9] * 1.8;                      % (not used for type 1 in your code)
+
+    % Parameters used by compute_L1_bounds (some are marked "not used" in your original)
+    uncert_config.df_dx         = [0 0 0.8; 0 0 0.2] * 1.8;   % not used
+    uncert_config.Lf            = norm(uncert_config.df_dx,'inf'); % not used
+    uncert_config.bf_vec_fcn    = @(alpha) [0.8 + 0.1*alpha^2;
+                                           0.1 + 0.2*alpha] * 1.8; % used
+    uncert_config.bf            = norm(w_max,'inf');                 % not used
+    uncert_config.lf_prime_vec  = [0.32*pi; 0] * 1.8;                % not used
+    uncert_config.lf_prime      = norm(uncert_config.lf_prime_vec,'inf'); % not used
+
+elseif sim_config.uncert_type == 2
+    % Time-dependent bounded disturbances only
+    f_uncert = @(t,x) [2*sin(pi*t/2); cos(pi*t/2)]; % 2x1
+    w_max    = [2 1];
+
+    uncert_config.Lf       = 0;
+    uncert_config.bf       = norm(w_max,'inf');
+    uncert_config.lf_prime = pi;
+end
+
+uncert_config.f_uncert    = f_uncert;
+uncert_config.w_uncert    = w_uncert;
+uncert_config.add_uncert  = sim_config.add_uncert;
+
+%% 3) Plant model (continuous-time)
+A = [0 0.0067 1.34;
+     0 -0.869 43.2;
+     0 0.993 -1.34];
+
+B = [0.169  0.252;
+     -17.3  -1.58;
+     -0.169 -0.252];
+
+B_perp = null(B');           % unmatched input direction (orthogonal to B')
+Bu     = B_perp * 0.15;      % unmatched input matrix
+
+% Baseline state feedback gain Kx
+% (You compute via place, then overwrite with a fixed gain used in your paper)
+Kx = place(A,B,[-30 -40 -40]);  
+Kx = -Kx;
+Kx = [3.25 0.891 7.12;
+     -6.1 -0.898 -10];
+
+Am = A + B*Kx;               % baseline stabilized dynamics
+
+% Tracking outputs (for plotting / bounds propagation)
+Cout = [1 0 1;   % pitch angle theta = gamma + alpha = x1 + x3 (per your model)
+        1 0 0];  % flight path angle gamma = x1
+Dout = zeros(2,2);
+
+% Input scaling for "v" (in your formulation, v corresponds to u_opt in L1MPC)
+Kv = eye(2);
+
+% v enters through Bv = B*Kv
+Bv = B*Kv;
+
+% Constraint enforcement output (angle of attack + inputs)
+% y_con = Ccon x + Dcon v
+Ccon = [0 0 1;
+        Kx];
+Dcon = [0 0;
+        Kv];
+
+% Dimensions
+n  = size(Am,1);
+nr = size(Bv,2);
+In = eye(n);
+m  = size(B,2);
+Im = eye(m);
+
+%% 4) Discretized matrices (mostly "not used" later; kept for completeness)
+dT_sys = 4e-3;
+
+[Am_d, Btotal_d, Cc_d, Dctotal_d] = ssdata( ...
+    c2d(ss(Am, [Bv B B_perp In], Ccon, [Dcon zeros(size(Dcon,1), n+n)]), dT_sys, 'zoh') );
+
+Bv_d      = Btotal_d(:, 1:nr);            %#ok<NASGU>
+B_d       = Btotal_d(:, nr+1:nr+m);       %#ok<NASGU>
+B_perp_d  = Btotal_d(:, nr+m+1:nr+n);     %#ok<NASGU>
+Bu_d      = [0.0014; 0.0001; 0.0014];     %#ok<NASGU> % (hardcoded in your original; not used)
+BI_d      = Btotal_d(:, nr+n+1:end);      %#ok<NASGU>
+Dc_d      = Dctotal_d(:, 1:nr);           %#ok<NASGU>
+Dp_d      = Dctotal_d(:, nr+1:nr+m);      %#ok<NASGU>
+Cc_d      = Ccon;                         %#ok<NASGU>
+
+%% 5) Pack plant and baseline controller configs for sim_L1MPC
+plant.Am      = Am;
+plant.B       = B;
+plant.Bu      = Bu;
+plant.B_perp  = B_perp;
+plant.Bv      = Bv;
+plant.In      = In;
+plant.Im      = Im;
+
+plant.Am_d    = Am_d;
+plant.Bv_d    = Bv_d;
+plant.Cc_d    = Cc_d;
+plant.Dc_d    = Dc_d;
+plant.B_d     = B_d;
+plant.dT_sys  = dT_sys;
+
+plant.B_perp_d = B_perp_d;
+plant.Bu_d     = Bu_d;
+plant.B_pinv   = pinv(B);
+plant.BI_d     = BI_d;
+
+plant.Cout    = Cout;
+plant.Dout    = Dout;
+
+baseline_config.Kx = Kx;
+baseline_config.Kv = Kv;
+
+%% 6) File naming (optional)
+if sim_config.add_uncert == 0
+    file_name = 'f16_nom'; %#ok<NASGU>
+else
+    file_name = ['f16_uncert_type' num2str(sim_config.uncert_type) '_']; %#ok<NASGU>
+end
+
+%% 7) L1 adaptive controller configuration + bound computation
+Klp = 200;                                   % LPF bandwidth (for Cs(s))
+L1_config.Cs = eye(2)*tf(Klp,[1 Klp]);       % low-pass filter Cs(s)
+
+Ae = -10*eye(n);                             % predictor dynamics
+L1_config.gamma1 = 0.01;                     % desired ||xr-x||_inf bound (user-chosen)
+Ta = 1e-7;                                   % estimator sample time (fast)
+
+% Discretized predictor matrices (some not used directly inside your sim)
+[Ae_d, BI_xhat_d, ~, ~] = ssdata(c2d(ss(Ae, In, In, 0), dT_sys, 'zoh')); %#ok<NASGU>
+
+L1_config.Ae         = Ae;
+L1_config.Ta         = Ta;
+L1_config.include_L1 = sim_config.use_L1;
+
+% adapt_gain = (e^{Ae*Ta}-I)^{-1} Ae e^{Ae*Ta}
+cal_adapt_gain = @(Ta) (expm(Ae*Ta)-In)\Ae*expm(Ae*Ta);
+L1_config.adapt_gain = cal_adapt_gain(Ta);
+
+% --- Compute bounds (this script should populate rho_u, rho_til_x, etc.) ---
+compute_L1_bounds
+
+%% 8) Manually selected bounds (your original block kept; only labeled)
+% NOTE: You have multiple candidate rho_u/rho_til_x blocks.
+% Keep only ONE active block to avoid accidental overrides.
+
+% (Your final active selection in the pasted script)
+rho_u      = [2.08e+00; 8.78e-01];
+rho_til_x  = [1.64e-01 7.63e-01 2.67e-02]';
+
+% Propagate bounds to outputs and total input (used for tightening)
+rho_til_y = abs(Cout) * rho_til_x;
+rho_til_u = abs(Kx)   * rho_til_x + rho_u
+
+% Sanity check prompt (kept)
+if sim_config.use_L1 == 1
+    answer = questdlg(['Did you run compute_L1_bounds with different Tx to check ' ...
+                       'whether the following rho_til_x and rho_til_u are correct?'], ...
+                       'Question for using state and input bounds', 'Yes','No','No');
+    switch answer
+        case 'Yes'
+        case 'No'
+            error('Please verify the following rho_til_x and rho_til_u are correct!');
+    end
+end
+
+%% 9) Constraint tightening (nominal MPC constraints)
+if sim_config.include_constraint_tighten == 1
+    Xcon_nom = [Xcon(1) - abs(rho_til_x(1)), ...
+                Xcon(2) - abs(rho_til_x(2)), ...
+                Xcon(3) - abs(rho_til_x(3))];
+    Ucon_nom = [Ucon(1) - abs(rho_til_u(1)), ...
+                Ucon(2) - abs(rho_til_u(2))];
+else
+    Xcon_nom = Xcon;
+    Ucon_nom = Ucon;
+end
+
+% If you want to persist tightening for your MPC scripts:
+% save xc.mat Xcon_nom;
+% save uc.mat Ucon_nom;
+
+%% 10) Reference command profile (fast rate) + load nominal MPC trajectory
+% NOTE: rHist is generated at the *fast simulation step* sim_config.dT.
+% The nominal MPC is typically solved at 0.004s, and its histories are loaded.
+
+rHist = [];
+sim_config.dT = 1e-4;                  % simulation integration step (fast)
+L1_config.Ta  = sim_config.dT;         % set estimator sampling = sim step
+L1_config.adapt_gain = cal_adapt_gain(L1_config.Ta);
+
+steps = 15/sim_config.dT;
+
+for k = 1:steps+1
+    if (k < floor(steps/2))
+        rHist(:,k) = [9, 6.5];
+    else
+        rHist(:,k) = [0, 0];
+    end
+end
+
+% Load nominal MPC trajectories computed separately at dT_sys = 0.004
+load umpchist_nominal.mat;   % Uhist: nominal MPC inputs over slow grid
+load xhist_nominal.mat;      % X:     nominal MPC states over slow grid
+
+%% 11) Run simulation (timed)
+x0 = [0;0;0];
+sim_config.x0 = x0;
+
+tic;
+simRst = sim_L1MPC(Ae_d, BI_xhat_d, Uhist, X, x0, rHist, plant, uncert_config, ...
+                  baseline_config, L1_config, sim_config, Xcon_nom, Ucon_nom);
+total_time = toc;
+fprintf('Total simulation time: %.6f seconds\n', total_time);
+
+%% 12) Build slow-time vector (0.004s) for plotting against MPC trajectories
+Time = [];
+for k = 1:floor(15/0.004)+1
+    Time(:,k) = (k-1)*0.004;
+end
+
+%% 13) Extract fast-rate signals from simRst
+xHist      = simRst.xcHist;          % real state at fast rate
+uHist      = simRst.uHist;           % real input at fast rate
+ul1Hist    = simRst.uL1Hist;         % L1 augmentation at fast rate
+sigma1Hist = simRst.sigmahatHist;    % estimated matched uncertainty at fast rate
+fHist      = simRst.fHist;           % true matched uncertainty at fast rate
+wHist      = simRst.wHist;           % true unmatched disturbance at fast rate
+
+%% 14) Downsample fast-rate signals to slow rate (0.004s) for plotting
+% We sample every (0.004 / sim_config.dT) steps
+stride = round(4e-3 / sim_config.dT);
+
+% Precompute number of downsampled points
+Ns = floor((steps)/stride) + 1;
+
+xreal     = zeros(size(xHist,1), Ns);
+ureal     = zeros(size(uHist,1), Ns);
+r         = zeros(size(rHist,1), Ns);
+ul1real   = zeros(size(ul1Hist,1), Ns);
+sigma1real= zeros(size(sigma1Hist,1), Ns);
+freal     = zeros(size(fHist,1), Ns);
+wreal     = zeros(size(wHist,1), Ns);
+
+count = 1;
+for k = 1:steps+1
+    if k == 1 || mod(k-1, stride) == 0
+        xreal(:,count)      = xHist(:,k);
+        ureal(:,count)      = uHist(:,k);
+        r(:,count)          = rHist(:,k);
+        ul1real(:,count)    = ul1Hist(:,k);
+        sigma1real(:,count) = sigma1Hist(:,k);
+        freal(:,count)      = fHist(:,k);
+        wreal(:,count)      = wHist(:,k);
+        count = count + 1;
+        if count > Ns, break; end
+    end
+end
+
+%% 15) Plots (real vs nominal vs reference)
+close all;
+
+figure;
+plot(Time, xreal(1,:) + xreal(3,:)); hold on
+plot(Time, X(1,:)    + X(3,:));      hold on
+plot(Time, r(1,:));
+title('theta, x1 + x3');
+legend('real x', 'x nom', 'ref');
+
+figure;
+plot(Time, xreal(1,:)); hold on
+yline(Xcon(1),'-','Constrain');
+yline(-Xcon(1),'-','Constrain');
+plot(Time, X(1,:)); hold on
+plot(Time, r(2,:));
+title('gamma, x1');
+legend('real x', 'x nom', 'ref');
+
+figure;
+plot(Time, xreal(2,:)); hold on
+yline(Xcon(2),'-','State Constrain');
+yline(-Xcon(2),'-','State Constrain');
+plot(Time, X(2,:));
+title('x2');
+legend('real x', 'x nom');
+
+figure;
+plot(Time, xreal(3,:)); hold on
+yline(Xcon(3),'-','State Constrain');
+yline(-Xcon(3),'-','State Constrain');
+plot(Time, X(3,:));
+title('x3');
+legend('real x', 'x nom');
+
+%% 16) Error bounds check: x_real - x_nom
+xt = xreal - X;   % deviation from nominal
+
+figure;
+plot(Time, xt(1,:));
+yline(rho_til_x(1),'-','Error Bound');
+yline(-rho_til_x(1),'-','Error Bound');
+title('x - xnom (1)');
+
+figure;
+plot(Time, xt(2,:));
+yline(rho_til_x(2),'-','Error Bound');
+yline(-rho_til_x(2),'-','Error Bound');
+title('x - xnom (2)');
+
+figure;
+plot(Time, xt(3,:));
+yline(rho_til_x(3),'-','Error Bound');
+yline(-rho_til_x(3),'-','Error Bound');
+title('x - xnom (3)');
+
+%% 17) Input constraint check
+figure;
+plot(Time, ureal(1,:));
+yline(Ucon(1),'-','Input Bound');
+yline(-Ucon(1),'-','Input Bound');
+title('u1');
+
+figure;
+plot(Time, ureal(2,:));
+yline(Ucon(2),'-','Input Constrain');
+yline(-Ucon(2),'-','Input Constrain');
+title('u2');
+
+%% 18) Matched uncertainty estimation vs truth
+figure;
+plot(Time, freal(1,:), 'g-'); hold on
+plot(Time, sigma1real(1,:), 'r--'); hold on
+plot(Time, freal(2,:), 'b-'); hold on
+plot(Time, sigma1real(2,:), 'y--');
+legend('f_1','sigma_1','f_2','sigma_2');
+
+figure;
+plot(Time, wreal);
+title('w');
+
+% Estimation error
+ferror = freal - sigma1real;
+
+figure;
+plot(Time, ferror(1,:));
+title('Error in f1');
+
+figure;
+plot(Time, ferror(2,:));
+title('Error in f2');
+
+%% 19) L1 augmentation bounds check
+figure;
+plot(Time, ul1real(1,:));
+yline(rho_u(1),'-','Error Bound');
+yline(-rho_u(1),'-','Error Bound');
+title('u_{L1}(1)');
+
+figure;
+plot(Time, ul1real(2,:));
+yline(rho_u(2),'-','Error Bound');
+yline(-rho_u(2),'-','Error Bound');
+title('u_{L1}(2)');
+
+%% 20) Save outputs (downsampled signals + nominal)
+save L1MPC_f.mat      freal;
+save L1MPC_w.mat      wreal;
+save L1MPC_sigma1.mat sigma1real;
+save L1MPC_u.mat      ureal;
+save L1MPC_ul1.mat    ul1real;
+save L1MPC_x.mat      xreal;
+save L1MPC_xnom.mat   X;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Notes for maintenance
+%   - If you change sim_config.dT, update stride = round(0.004 / sim_config.dT)
+%   - Ensure umpchist_nominal.mat and xhist_nominal.mat match the same MPC dT (0.004s)
+%   - Only keep one rho_u / rho_til_x block active to avoid accidental overwrites
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
