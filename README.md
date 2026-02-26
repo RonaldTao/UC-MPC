@@ -4,8 +4,8 @@ This repo contains MATLAB code for constrained control of an F-16 pitch attitude
 
 - **Nominal MPC** with constraint tightening (offline nominal plan)
 - **Vanilla MPC** (baseline MPC without ancillary feedback / tightening)
-- **Tube MPC** (nominal MPC on tightened sets + ancillary LQR feedback)
-- **UC-MPC** (nominal MPC trajectory augmented by L1 adaptive control during execution)
+- **Tube MPC** (nominal MPC on tightened sets + robust ancillary feedback)
+- **UC-MPC** （nominal MPC + robust ancillary feedback + adaptive uncertainty compensation)
 
 The model and example are based on the linearized F-16 pitch dynamics 
 
